@@ -10,12 +10,91 @@
 .. contents::
 .. sectnum::
 
-Explicit Splice Imports Extension
-==============
+import for splice -- imports to use within a splice, at level -1
+import for quote  -- imports to be used within a quote, at level 1
+import for stage -1  -- imports to be used at stage -1, ie at splice
 
-This proposes a new extension, ``ExplicitSpliceImports``, which modifies the
+Respond to https://github.com/ghc-proposals/ghc-proposals/pull/412#issuecomment-905371210 with a concrete example of this working with splice + quote imports.
+
+NO PATH BASED CSP. Only lifted.
+But using lift instances requires the corresponding module to be available at
+both runtime and compile time. Bummer but no way around.
+No ESI => if imported in module with TH, both. Otherwise, just runtime.
+ESI => depending on how its imported, either runtime or compile time or both.
+
+Interaction between CSP and ESI
+
+Respond to Sebastian's comment, explain how it works with our system.
+
+-- If you write ``Lift`` then you can't use ExplicitSpliceImports in that module as you need CSP.
+
+1. import splice A, either
+    * A is not ESI
+        * A is needed at compile time and runtime
+        * And all of its dependecies too.
+    * A is ESI
+        * A is needed at compile time
+        * Its normal and splice imports too
+        * Its quote imports needed at runtime, but not compile time
+1a. Module uses TH and import A
+
+2. To define Lift, you CANNOT use ESI because you need CSP::
+
+    X @ 0 and X @ 1
+    x X = [| X |]
+
+3. A module defining lift, and all its dependencies, are needed both at runtime and compile time when splice-imported.
+
+TH example::
+
+    $(printf "%n in %s") 10 "str" ==> "10 in str"
+
+
+    -- $() -> +1 from inside to out (-1 to get inside)
+    -- [||] -> -1 from inside to out (+1 to get inside)
+    -- top-level splice - -1 to 0 (from inside to outside)
+
+    import splice Prelude -- show(+1) ==> -1 to 0
+    import quote Prelude -- shown
+
+
+
+    -- BAN CSP 
+    -- $( -1 ) ==> 0; [| +1 |] => 0
+
+    qshow{-n-} = [| show{-n-} |]
+                   --n+1------  
+
+    gen{-n-} (D:xs{-n-}) x{-n-} = [| \n{-n+1-} -> $(gen{-n-} xs{-n-} [| $(x{-n-}) ++ show{-nbad,n+1good-} n{-n+1-} |]) |]
+                                                                          --n---                         
+                                                                       ---n + 1------------------------------------
+                                                    ----Level n------------------------------------------------------
+                                    --Level n+1------------------------------------------------------------------------
+    ---Level n-----------------------------------------------------------------------------------------------------------
+
+    module A
+
+    gen -- level 0
+
+
+    module B
+
+    import A (gen) -- gen at level 0
+    --import splice A (gen) -- gen at level -1
+
+    foo = $(gen)
+
+Add information about the possibility to eventually do a ``macro`` keyword, and
+how that can be easily built on top of our design since it essentially amounts
+to splitting a couple of granular definitions into a separate module during elaboration.
+
+Explicit Stage Imports Extension
+================================
+
+This proposes a new extension, ``ExplicitStageImports``, which modifies the
 import syntax so that imports which are only used at compile-time are marked explicitly.
-
+When the extension is enabled, path-based cross stage persistence is disabled
+and normal imports /cannot/ be used at compile time (at levels ``< 0``).
 
 Motivation
 ----------
@@ -67,9 +146,14 @@ Definitions
 
 level
   Each expression exists at a level. The level is increased by 1 when
-  inside a quote and decreased by 1 inside a splice. Therefore the level of
-  an expression can be calculated as the number of quotes surrounding an expression
-  subtract the number of splices. For example::
+  inside a quote and decreased by 1 inside a splice.
+    In short:
+        * ``$(e at n-1)`` is at level ``n``
+        * ``[| e at n+1 |]`` is at level ``n``
+
+  Therefore the level of an expression can be calculated as the number of
+  quotes surrounding an expression subtract the number of splices. For
+  example::
 
     -- foo is at level 0
     foo = $(let
@@ -89,7 +173,6 @@ level
       ) in bar
     )
 
-
 top-level splice
   A splice, where the body is at a negative level, an unadorned
   declaration splice or a quasiquoter.
@@ -98,30 +181,140 @@ top-level splice
 home module
   A module from the package that is currently being compiled.
 
+Background: Loading for TH and Cross Stage Persistence
+------------------------------------------------------
+
+Currently, all module and package dependencies of any module that enables
+``TemplateHaskell`` must be compiled and made further available at
+compile-time to allow identifiers to be used both at the top-level (runtime) or
+within top-level splices (compile time).
+
+Additionally, a free variable, defined or bound at level ``0``, may be used in
+the body of a quote (i.e. at a level ``n > 0``), which can be spliced in the
+future, due to so called Cross Stage Persistence (CSP). For instance, the
+following is accepted because of cross stage persistence::
+
+    {-# LANGUAGE TemplateHaskell #-}
+
+    one = [| \x -> succ x |]
+    two x = [| succ x |]
+
+
+Crucially, in the rhs of ``one``, ``succ`` is bound at level 0 (at the top-level), but
+used in the body of a quote at level 1 (while ``x`` is bound at level 1).  In
+``two``, both ``succ`` *and* ``x`` are bound at level 0 but used at level 1.
+
+There are two forms of Cross Stage persistence, both of which are needed to
+make the examples work:
+
+* **Path-based persistence**: all top-level identifiers at level 0 are
+  made available at future levels (i.e., top level ``x`` bound at level ``n`` is also
+  available at level ``n+1``, ``n+2``, ...).
+
+  Intuitively, this is fine because all top-level identifiers will still exist in
+  that module even if spliced at a future stage.
+
+  This explains why the occurrence of ``succ`` in example ``one`` and ``two`` is valid.
+
+* **Serialisation-based/Lift persistence**: if an identifier can't be persisted
+  to a future stage using path-based csp, we will attempt a serialisation-based
+  approach.
+
+  As long as a value's representation can be computed at runtime, we
+  can serialise that value to persist it to future stages. This serialisation is
+  defined as ``lift`` of the ``Lift`` typeclass.
+
+  Serialisation-based CSP explains why the ``x`` in ``two`` can be moved from
+  a value that exists at compile time to one that exists at runtime. The
+  compiler will implicitly introduce a call to ``lift`` such as::
+
+      two x = [| succ x |]
+      ===>
+      two x = [| succ $(lift x) |]
+
+  And lift will take care of converting the compile-time ``x`` into a runtime value.
+  All base types such as ``Int``, ``Bool``, ``Float``, ... instance ``Lift``, and user
+  types can instance it automatically with ``DeriveLift``.
+
+Note: ``Lift`` instances will look something like::
+
+    data MInt = Some Int | None
+    instance Lift MInt where
+        lift (None) = [| None |]
+        lift (Some x) = [| Some $(lift x) |]
+
+An important observation is that the data constructors ``None`` and ``Some``
+are persisted using Path-based CSP. Operationally, ``None`` and ``Some`` are
+needed both at compile-time *and*  runtime since they are matched on at compile
+time, and persisted to be spliced in the future into a program that can make
+use of them at runtime.
+
+Intuitively, it's just that ``Lift`` converts a compile-time value to a runtime value *by definition*!
+
+The corollary is that, regardless of ``ExplicitStageImports``, using in a
+top-level splice a lift instance from module ``X`` implies ``X`` must necessarily be made
+available at both compile time and runtime.
 
 Proposed Change
 ---------------
 
-The new language extension ``ExplicitSpliceImports`` adds a
-new import modifier to the import syntax. An import is marked as a "splice"
-import when it is prefixed with ``splice``::
+The key idea behind this proposal is to forbid identifiers implicitly being
+available at both compile-time and run-time, in favour of explicitly importing
+bindings for *either* one or the other.
 
-  {-# LANGUAGE ExplicitSpliceImports #-}
+When the new language extension ``ExplicitStageImports`` is enabled, we **forbid**:
+
+* All bindings imported using the traditional ``import`` statement from occurring inside
+  of top-level splices (and thus being used compile-time).
+* In its entirety, path-based cross stage persistence, thus forbidding
+  traditional ``imports`` from being used within quotes.
+
+Complementary, we **introduce** two new import modifiers to the import syntax:
+``splice`` and ``quote``.
+
+* A ``splice`` import of ``A`` will import all bindings of ``A`` to be used *only* at
+  compile-time, within top-level splices.
+* A ``quote`` import of ``B`` will import all bindings of ``B`` to be used
+  *only* within quotes, which will be possibly used at runtime when those quotes spliced.
+
+Note the clear duality in the forbidden *implicit* stage-related behaviours in exchange for
+introducing dual *explicit* stage-related mechanisms.
+
+The great benefit of being explicit over implicit is we no longer need to
+pessimistically assume all modules to be needed both at compile-time vs
+run-time, since explicitness tells us exactly which are needed when.
+
+For modules where ``ExplicitStageImports`` is disabled, we keep the previous
+behaviour: no restrictions on the stages at which imported bindings are in place,
+since that module and its dependencies must still be pessimistically assumed to
+be needed both at compile time and run time.
+
+Splice imports
+##############
+
+An import is marked as a "splice" import when it is prefixed with ``splice``::
+
+  {-# LANGUAGE ExplicitStageImports #-}
   {-# LANGUAGE TemplateHaskell #-}
   module Main where
 
   -- (1)
-  import splice B
+  import splice B (foo)
 
   -- (2)
-  import A
+  import A (bar)
+
+  x = $(foo 25) -- accepted
+  y = $(bar 33) -- rejected
 
 
-The splice modifier indicates to the compiler that module B is only used at compile time
-and hence the imports can **only** be used inside top-level splices (1). When the extension is enabled,
-imports without the splice modifier are only available at runtime and therefore not available to be used in top-level splices (2).
-In this example, identifiers from ``B`` can **only** be used in top-level splices
-and identifiers from ``A`` can be used everywhere, apart from in top-level splices.
+The ``splice`` modifier indicates to the compiler that module ``B`` is only used at
+compile time and hence the imports can **only** be used inside top-level
+splices (1). When the extension is enabled, imports without the splice modifier
+are only available at runtime and therefore not available to be used in
+top-level splices (2). In this example, identifiers from ``B`` can **only** be
+used in top-level splices and identifiers from ``A`` can be used everywhere,
+apart from in top-level splices.
 
 To make some of the initial motivation explicit:
 
@@ -131,11 +324,177 @@ To make some of the initial motivation explicit:
 2. When cross-compiling, only ``A`` needs to be built for the target and ``B``
    only for the host as it is only used at build-time.
 
-If you require scenario (3) then two imports declarations can be used::
+If you require scenario (3), where a module is needed both at compile-time and
+run-time, then two imports declarations can be used::
 
   -- (3)
   import C
   import splice C
+
+Example
+~~~~~~~
+
+To examplify our design we use `printf` from "Template Meta-programming for Haskell" by
+Simon Peyton Jones and Tim Sheard.
+
+Let ``printf :: String -> Q Exp`` be defined in ``Printf``, such that the
+arguments received by printf applied to a formatting string is determined at
+compile time based on the format specifiers within the string::
+
+    $(printf "Error: %s on line %d") "test" 123 :: String
+
+According to our proposal, the following program would be rejected::
+
+    {-# LANGUAGE ExplicitStageImports #-}
+
+    import Printf (printf)
+
+    -- rejected!
+    x = $(printf "Error: %s on line %d") "test" 123 :: String
+
+because ``printf`` was imported "normally" at the default level 0 and thus
+cannot occur within a top-level splice (at level -1). For this program to be
+stage correct, ``printf`` must be imported at level -1 to be used within a
+top-level splice::
+
+    {-# LANGUAGE ExplicitStageImports #-}
+
+    import splice Printf (printf)
+
+    -- accepted!
+    x = $(printf "Error: %s on line %d") "test" 123 :: String
+
+Splice-importing ``Printf`` makes it clear to both humans and compilers that
+``printf`` will only be required at compile time, since it will only be used within top-level splices.
+
+Quote imports
+#############
+
+An import is marked as a "quote" import when it is prefixed with ``quote``::
+
+  {-# LANGUAGE ExplicitStageImports #-}
+  {-# LANGUAGE TemplateHaskell #-}
+  module Main where
+
+  -- (1)
+  import quote B (foo)
+
+  -- (2)
+  import A (bar)
+
+  x = [| foo 25 |] -- accepted
+  y = [| bar 33 |] -- rejected
+
+
+The ``quote`` modifier indicates to the compiler that module ``B`` *may be*
+used at runtime because it enables its identifiers to be used within *quotes*.
+
+When a quote such as ``x = [| foo 25 |]`` is spliced, i.e. ``z = $(x)``,
+its contents will be needed to execute the program at runtime (``y = foo 25``,
+so evaluating ``y`` at runtime requires ``foo`` to be available):
+
+A ``quote`` import says the above explicitly: the imported module can be used
+at *runtime*. The compiler can then guarantee the module is available at
+runtime.
+
+When the extension is enabled, quote imports can **only** be used inside quotes
+(1).  Imports without the quote modifier are only available at *the top-level*,
+and therefore not available to be used inside quotes (2).
+In this example, identifiers from ``B`` can **only** be used in quotes and
+identifiers from ``A`` can be used everywhere, apart from quotes (and splices).
+
+**Why do we want to be explicit about quotes as well?**
+
+Previously, path-based cross stage persistence meant *any* imported identifier
+could eventually be used at runtime (when spliced)! This made path-based CSP an
+enemy of explicit stage imports -- when we ``splice`` import a module, the
+guarantee should be that the module is *only* needed at compile-time, but CSP
+means all splice-imported modules could also be needed at *runtime*.
+
+By forbidding path-based CSP, we guarantee that all dependencies that may be
+needed at runtime, when identifiers from this module are spliced, are marked
+explicitly as so.
+
+Clarifying what runtime is
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This is a bit unintuitive at first: aren't all imported modules by default
+available at runtime -- and only splice imported ones at compile-time?  We've
+been talking about non-splice imports as runtime imports, but now it's quote
+imports that are runtime imports?
+
+No! There's still just one run-time (level 0), and one compile-time (level -1).
+
+But there is a critical distinction between the level of a module, and
+the level a module *is imported at*.
+
+In the a module ``Main``, top-level definitions and normal imports are at level ``0`` (runtime), however:
+
+* A ``splice`` import *offsets* the level of all bindings in that module by ``-1``.
+* A ``quote`` import *offsets* the level of all bindings in that module by ``+1``.
+
+This means that all top-level bindings of a module imported with ``splice`` are
+imported at level -1, *not at level 0*! Consequently, quote imports of that
+module are effectively offset by ``-1``, or level ``-1 + 1``, or level ``0``,
+which means at runtime in this ``Main`` module. So splice imports and quote
+imports cancel themselves out perfectly.
+
+Example
+~~~~~~~
+
+This offsetting can be understood more clearly through an example.
+Module ``A`` splices ``foo`` from module ``B`` which both quotes ``bar`` from module ``C`` and uses ``baz`` from ``D``::
+
+    {-# LANGUAGE ExplicitStageImports #-}
+    module A where
+    import splice B (foo)
+
+    -- foo can be used within a splice (level -1) because of the splice import (-1).
+    x = $(foo 10)
+
+
+    {-# LANGUAGE ExplicitStageImports #-}
+    module B where
+    import D (baz)
+    import quote C (bar)
+
+    -- bar can be used within a quote (level +1) because of the quote import (+1)
+    foo x
+      | baz x = [| bar * 2 |]
+      | otherwise = [| bar |]
+
+    {-# LANGUAGE ExplicitStageImports #-}
+    module C where
+    bar = 42
+
+    module D where
+    baz 0 = True
+    baz _ = False
+
+In this chain of modules, both ``A`` and ``C`` are needed at runtime (since
+``x`` can occur at runtime, and ``bar`` is part of the runtime definition of
+``x``!), unlike module ``B`` which is only needed at compile-time (``foo`` is
+not needed when the program executes!).
+
+The perhaps curious case is ``D``: is it needed at compile time or runtime? It
+does not use a splice import, so one could think it is needed at runtime -- but
+here is where the distinction between the *offset* level and base level is
+relevant. At a glance, ``D`` would be needed at runtime, however, it is only
+being imported as a dependency of ``B`` which is *offset* -1. This makes ``D``
+*also* offset at *-1*! Note how ``baz`` is just needed at compile time to define
+``foo``, which is properly ``splice`` imported.
+
+The transitive closure of a ``splice`` imported module is at the same level as
+the imported module. ``quote`` imports offset the modules that will be needed
+back to runtime, and make the levels all align correctly.
+
+What happens without ExplicitStageImports
+-----------------------------------------
+
+TODO
+
+Implementation
+################
 
 The syntax for imports is changed in the follow way::
 
@@ -347,3 +706,11 @@ Alternatives
 
 Unresolved Questions
 --------------------
+
+* Hs-boot modules
+* Type families
+* Instances and orphans
+* Defaulting?
+* Class constraints
+* Classes in general
+
