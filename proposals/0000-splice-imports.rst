@@ -91,16 +91,29 @@ to splitting a couple of granular definitions into a separate module during elab
 Explicit Stage Imports Extension
 ================================
 
-This proposes a new extension, ``ExplicitStageImports``, which modifies the
-import syntax so that imports which are only used at compile-time are marked explicitly.
-When the extension is enabled, path-based cross stage persistence is disabled
-and normal imports /cannot/ be used at compile time (at levels ``< 0``).
+We propose a new extension, ``ExplicitStageImports``, that restricts programs
+to be level-correct -- i.e. with ``ExplicitStageImports``, a normal import
+(level 0) cannot be used in a top-level splice (level -1) or within a quote
+(level 1).
+
+It modifies the import syntax so that imports which are to be used at the
+splice or quote level are marked explicitly as so, essentially importing them
+at a different level that matches the level of their use site.
+
+In short:
+
+* The goal -- only allow level correct programs.
+* The mechanism -- control level via imports.
+
+.. When the extension is enabled, path-based cross stage persistence is disabled
+.. and normal imports /cannot/ be used at compile time (at levels ``< 0``).
 
 Motivation
 ----------
 
-The primary goal of this proposal is to distinguish, in the module header, three different ways that
-imported module imports are used:
+The primary motivation for level-correct programs is for programmers and
+compilers to be able to distinguish three different ways
+that imported module imports are used:
 
 1. Imported modules whose code is executed only at compile time;
 2. Imported modules whose code is executed only at runtime;
@@ -192,9 +205,11 @@ within top-level splices (compile time).
 Additionally, a free variable, defined or bound at level ``0``, may be used in
 the body of a quote (i.e. at a level ``n > 0``), which can be spliced in the
 future, due to so called Cross Stage Persistence (CSP). For instance, the
-following is accepted because of cross stage persistence::
+following program is accepted because of cross stage persistence::
 
     {-# LANGUAGE TemplateHaskell #-}
+
+    -- succ :: Int -> Int
 
     one = [| \x -> succ x |]
     two x = [| succ x |]
@@ -258,9 +273,13 @@ available at both compile time and runtime.
 Proposed Change
 ---------------
 
-The key idea behind this proposal is to forbid identifiers implicitly being
-available at both compile-time and run-time, in favour of explicitly importing
-bindings for *either* one or the other.
+The key idea is that making programs level-correct guarantees a clear stage
+separation which allows the compiler to reason about stages in order to deliver
+on our motivation.
+
+The key change necessary for level-correctness is to forbid identifiers
+*implicitly* being available at both compile-time and run-time in exchange for
+*explicitly* importing bindings for either one, the other or both.
 
 When the new language extension ``ExplicitStageImports`` is enabled, we **forbid**:
 
@@ -397,11 +416,12 @@ A ``quote`` import says the above explicitly: the imported module can be used
 at *runtime*. The compiler can then guarantee the module is available at
 runtime.
 
-When the extension is enabled, quote imports can **only** be used inside quotes
-(1).  Imports without the quote modifier are only available at *the top-level*,
-and therefore not available to be used inside quotes (2).
-In this example, identifiers from ``B`` can **only** be used in quotes and
-identifiers from ``A`` can be used everywhere, apart from quotes (and splices).
+When the extension is enabled, quote imports can **only** be used inside
+quotes, that is, at level 1 (1). Imports without the quote modifier are only
+available at *the top-level*, and therefore not available to be used inside
+quotes (2). In this example, identifiers from ``B`` can **only** be used in
+quotes and identifiers from ``A`` can be used everywhere, apart from quotes
+(and splices).
 
 **Why do we want to be explicit about quotes as well?**
 
