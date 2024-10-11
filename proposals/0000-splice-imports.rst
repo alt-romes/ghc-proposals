@@ -211,7 +211,10 @@ following program is accepted because of cross stage persistence::
 
     -- succ :: Int -> Int
 
+    one :: Q Exp
     one = [| \x -> succ x |]
+
+    two :: Int -> Q Exp
     two x = [| succ x |]
 
 
@@ -273,9 +276,9 @@ available at both compile time and runtime.
 Proposed Change
 ---------------
 
-The key idea is that making programs level-correct guarantees a clear stage
-separation which allows the compiler to reason about stages in order to deliver
-on our motivation.
+The key idea is that making programs level-correct guarantees a separation of
+imports into independent stages which enables the compiler to improve
+compilation according to our motivation.
 
 The key change necessary for level-correctness is to forbid identifiers
 *implicitly* being available at both compile-time and run-time in exchange for
