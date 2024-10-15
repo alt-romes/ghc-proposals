@@ -14,8 +14,8 @@
 Explicit Stage Imports Extension
 ================================
 
-When writing staged programs they must be level correct. We propose a new
-pair of extenensions which allow programmers to write level correct programs without
+When writing staged programs they must be level correct. We propose a new pair
+of extensions which allow programmers to write level correct programs without
 resorting to cross-stage persistence.
 
 ``NoImplicitStagePersistence`` forbids top-level identifiers from occurring at
@@ -24,48 +24,39 @@ non-zero levels (i.e. within top-level splices and quotes), and
 identifiers to enable their use in top-level splices (level -1) or within
 quotes (level 1).
 
+In short:
 
+* The goal -- only allow level correct programs (enforced by ``NoImplicitStagePersistence``).
+* The mechanism -- control level via imports (enabled by ``ExplicitStageImports``).
 
 ImplicitStagePersistence
 ------------------------
 
-The ``ImplicitStagePersistence`` extension is introduce to control the
-existing path-based cross stage peristence behaviour. This can now be disabled to
-force programmers to control levels specifically with staged imports.
+The ``ImplicitStagePersistence`` extension is introduce to control the existing
+path-based cross stage peristence behaviour and compile-time availability of
+all top-level identifiers. This can now be disabled to force programmers to
+control levels specifically with staged imports::
 
-::
+   import B (foo)
    data C = C
 
-   -- Allowed due to ``ImplicitStagePeristence``
+   -- Both allowed due to ``ImplicitStagePersistence``
    quoteC = [| C |]
+   spliceC = $( foo )
+
 
 ExplicitStageImports
 --------------------
 
 The ``ExplicitStageImports`` extension adds a new import modifier which controls
-the level at which identifiers from the module are brought into scope.
+the level at which identifiers from the module are brought into scope::
 
-::
   import quote Foo (bar) -- bar is introduced at level 1
   import Foo (baz) -- baz is introduced at level 0
   import splice Foo (qux) -- qux is introduced at level -1
 
-
 .. When the extension is enabled, path-based cross stage persistence is disabled
 .. and normal imports /cannot/ be used at compile time (at levels ``< 0``).
-
-We additionally propose ``ImplicitLifting``, an extension to disable/enable
-implicit lifting of ill-staged expressions into well-staged ones by ``Lift``,
-as an orthogonal complement to the above. The reasoning is that implicit
-lifting is not always desireable (see example in the dedicated section), and
-since we're re-thinking the implicit behaviours concering stages in this
-proposal, it is fitting to also provide an extension to disable this particular
-implicitness.
-
-In short:
-
-* The goal -- only allow level correct programs (enforced by ``NoImplicitStagePersistence``).
-* The mechanism -- control level via imports (enabled by ``ExplicitStageImports``).
 
 Motivation
 ----------
@@ -251,14 +242,11 @@ Proposed Change
 
 The key idea is that making programs level-correct requires us to distinguish
 modules needed for use at compile time vs for use at runtime, by using new
-*stage* imports.
-This distinction allows the compiler to segregate the modules and packages
-needed at compile-time from those needed at runtime, fullfilling our
-motivation.
+*stage* imports. The compiler can leverage this information to fullfill our motivation.
 
-The core change necessary for level-correctness is to forbid identifiers
-*implicitly* being available at both compile-time and run-time in exchange for
-*explicitly* importing bindings for either one, the other or both.
+At the language level, the change necessary for level-correctness is to forbid
+identifiers *implicitly* being available at both compile-time and run-time in
+exchange for *explicitly* importing bindings for either one, the other or both.
 
 When the new language extension ``NoImplicitStagePersistence`` is enabled, we **forbid**:
 
@@ -320,16 +308,6 @@ When both are enabled, ``splice`` and ``quote`` imports can be used, but there
 will be no benefit to doing so because ``ImplicitStagePersistance`` still
 allows ill-staged programs (and thus the compiler must still be pessimistically
 assume all modules are needed at all stages).
-
-ImplicitLifting
-~~~~~~~~~~~~~~~
-
-``ImplicitLifting`` introduces ``lift`` calls automatically to make programs
-stage correct (i.e. ``f x = [| x |]`` ==> ``f x = [| $(lift x) |]``), preserving the
-current behaviour of Haskell programs.
-
-``NoImplicitLifting`` disables this implicit behaviour in favour of explicitly
-writing out the ``lift`` calls.
 
 Splice imports
 ##############
@@ -646,12 +624,20 @@ identifier was imported with ``splice``. This is important because it will allow
 GHC to emit errors advising the user to modify their import declarations.
 
 The driver will be modified to ensure that, for modules with
-``-XTemplateHaskell``, object code is generated for ``splice`` imported modules,
-whereas today it ensures object code is available for all imported modules.
+``-XTemplateHaskell``, object code is loaded for ``splice`` imported modules
+**only**, whereas today it ensures object code is available for all imported
+modules.
 
+The ``splice`` imported modules themselves may use normal, ``splice``, and ``quote`` imports:
+
+* Normal imports of a ``splice`` import are (transitively) also imported at level -1, and thus loaded at compile-time as well.
+* ``Quote`` imports of the ``splice`` import are offset to level 0, and thus will be made available at runtime.
+* Other ``splice`` imports of the ``splice`` import will also be loaded at
+  compile-time, since they may be used in the code generation step of the
+  module being imported.
 
 Level Specification of staged imports
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~-----
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 * Ordinary imports introduce variables at level 0
 * Splice imports introduce variables at level -1
@@ -733,6 +719,66 @@ Drawbacks
 ---------
 
 * The user has to be aware of the significance of using splice imports.
+* Since the mechanism to control the levels of binders is *module-granular*,
+  code in certain situations is necessary to be defined across two modules, for
+  instance::
+
+    -- previously accepted
+    module A where
+    data B = B
+    x = [| B |]
+
+    -- necessary split to be level-correct with ESI/NoISP
+    module A where
+    import quote B (B)
+    x = [| C |]
+    module B where
+    data B = B
+
+* It isn't possible to define a non-orphan ``Lift`` instance with
+  ``NoImplicitStagePersistence``, because the definition of ``Lift``
+  essentially amounts to serializing a datatype value from compile-time to
+  runtime -- i.e., ``Lift`` requires the datatype to be available both at
+  compile-time and runtime. To do this within the same module where the
+  datatype is defined, you need cross-stage persistence::
+
+    X @ 0 and X @ 1
+    x X = [| X |]
+
+  This isn't problematic, rather, just a result of what ``Lift`` means.
+  However, it may require/drive users to define ``Lift`` able datatypes in leaf
+  modules to benefit more from ``NoImplicitStagePersistence`` in general.
+
+  NB: All the dependencies of this module will also need to be
+  available both at runtime and compile time when this module is used to
+  generate code as a consequence of ``NoImplicitStagePersistence``.
+
+
+Future Feature Compatibility
+----------------------------
+
+One possible design that mitigates the need for module-level granularity of
+imports, yet inspired by the Racket language, is the introduction of an
+additional ``macro`` keyword that introduces bindings at a different level.
+
+A ``macro`` annotated binding will introduce a binding at the -1 level, without
+requiring it to be ``splice`` imported from a different module.
+
+We believe this proposal shouldn't include such a change for two reasons:
+
+* First, our proposed design lays out the foundation for well-staged programs,
+  and is forward-compatible/can be readily extended with such a ``macro``
+  keyword.  Tentatively, the implementation could amount to splitting ``macro``
+  bindings from non ``macro`` ones and elaborate the two sets of bindings into
+  separate modules that use ``splice`` imports (and then GHC would handle them
+  as described by this proposal).
+
+* Second, we imagine the possible advent of local modules as described by
+  https://github.com/ghc-proposals/ghc-proposals/pull/283 to bring forward all
+  the convinience of the ``macro`` keyword without the need for additional
+  language complexity (local modules are a much more general concept, but
+  yields the same results wrt to having a dedicated ``macro``)
+
 
 Alternatives
 ------------
@@ -800,7 +846,6 @@ Alternatives
   On the other hand, it's quite unfortunate to require having yet another
   package just for TH, and may drive away adoption...
 
-
 Unresolved Questions
 --------------------
 
@@ -811,13 +856,16 @@ Unresolved Questions
 * Class constraints
 * Classes in general
 
+* Respond to
+  https://github.com/ghc-proposals/ghc-proposals/pull/412#issuecomment-905371210
+  with a concrete example of this working with splice + quote imports.
+
+* Respond to Sebastian's comment, explain how it works with our system.
+
+
 .. import for splice -- imports to use within a splice, at level -1
 .. import for quote  -- imports to be used within a quote, at level 1
 .. import for stage -1  -- imports to be used at stage -1, ie at splice
-
-Respond to
-https://github.com/ghc-proposals/ghc-proposals/pull/412#issuecomment-905371210
-with a concrete example of this working with splice + quote imports.
 
 .. NO PATH BASED CSP. Only lifted.
 .. But using lift instances requires the corresponding module to be available at
@@ -826,28 +874,14 @@ with a concrete example of this working with splice + quote imports.
 .. ESI => depending on how its imported, either runtime or compile time or both.
 
 .. Interaction between CSP and ESI
-t
-Respond to Sebastian's comment, explain how it works with our system.
 
--- If you write ``Lift`` then you can't use ExplicitSpliceImports in that module as you need CSP.
+.. 1. import splice A, either
+..     * A is not ESI
+..         * A is needed at compile time and runtime
+..         * And all of its dependecies too.
+..     * A is ESI
+..         * A is needed at compile time
+..         * Its normal and splice imports too
+..         * Its quote imports needed at runtime, but not compile time
+.. 1a. Module uses TH and import A
 
-1. import splice A, either
-    * A is not ESI
-        * A is needed at compile time and runtime
-        * And all of its dependecies too.
-    * A is ESI
-        * A is needed at compile time
-        * Its normal and splice imports too
-        * Its quote imports needed at runtime, but not compile time
-1a. Module uses TH and import A
-
-2. To define Lift, you CANNOT use ESI because you need CSP::
-
-    X @ 0 and X @ 1
-    x X = [| X |]
-
-3. A module defining lift, and all its dependencies, are needed both at runtime and compile time when splice-imported.
-
-Add information about the possibility to eventually do a ``macro`` keyword, and
-how that can be easily built on top of our design since it essentially amounts
-to splitting a couple of granular definitions into a separate module during elaboration.
