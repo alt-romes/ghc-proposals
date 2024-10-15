@@ -10,49 +10,13 @@
 .. contents::
 .. sectnum::
 
-.. import for splice -- imports to use within a splice, at level -1
-.. import for quote  -- imports to be used within a quote, at level 1
-.. import for stage -1  -- imports to be used at stage -1, ie at splice
-
-Respond to
-https://github.com/ghc-proposals/ghc-proposals/pull/412#issuecomment-905371210
-with a concrete example of this working with splice + quote imports.
-
-.. NO PATH BASED CSP. Only lifted.
-.. But using lift instances requires the corresponding module to be available at
-.. both runtime and compile time. Bummer but no way around.
-.. No ESI => if imported in module with TH, both. Otherwise, just runtime.
-.. ESI => depending on how its imported, either runtime or compile time or both.
-
-.. Interaction between CSP and ESI
-
-Respond to Sebastian's comment, explain how it works with our system.
-
--- If you write ``Lift`` then you can't use ExplicitSpliceImports in that module as you need CSP.
-
-1. import splice A, either
-    * A is not ESI
-        * A is needed at compile time and runtime
-        * And all of its dependecies too.
-    * A is ESI
-        * A is needed at compile time
-        * Its normal and splice imports too
-        * Its quote imports needed at runtime, but not compile time
-1a. Module uses TH and import A
-
-2. To define Lift, you CANNOT use ESI because you need CSP::
-
-    X @ 0 and X @ 1
-    x X = [| X |]
-
-3. A module defining lift, and all its dependencies, are needed both at runtime and compile time when splice-imported.
-
-Add information about the possibility to eventually do a ``macro`` keyword, and
-how that can be easily built on top of our design since it essentially amounts
-to splitting a couple of granular definitions into a separate module during elaboration.
 
 Explicit Stage Imports Extension
 ================================
+
+When writing staged programs they must be level correct. We propose a new
+pair of extenensions which allow programmers to write level correct programs without
+resorting to cross-stage persistence.
 
 We propose two new extensions, ``ExplicitStageImports`` and
 ``NoImplicitStagePersistence``, that restrict programs to be level-correct.
@@ -66,6 +30,30 @@ In short:
 
 * The goal -- only allow level correct programs (enforced by ``NoImplicitStagePersistence``).
 * The mechanism -- control level via imports (enabled by ``ExplicitStageImports``).
+
+ExplicitStageImports
+--------------------
+
+The ``ExplicitStageImports`` extension adds a new import modifier which controls
+the level at which identifiers from the module are brought into scope.
+
+::
+  import quote Foo (bar) -- bar is introduced at level 1
+  import Foo (baz) -- baz is introduced at level 0
+  import splice Foo (qux) -- qux is introduced at level -1
+
+ImplicitStagePersistence
+------------------------
+
+The ``ImplicitStagePersistence`` extension is introduce to control the
+existing path-based cross stage peristence behaviour.
+
+::
+   data C = C
+
+   -- Allowed due to ``ImplicitStagePeristence``
+   quoteC = [| C |]
+
 
 .. When the extension is enabled, path-based cross stage persistence is disabled
 .. and normal imports /cannot/ be used at compile time (at levels ``< 0``).
@@ -81,15 +69,27 @@ implicitness.
 Motivation
 ----------
 
-The primary motivation for level-correct programs is for programmers and
-compilers to be able to distinguish three different ways
-that imported module imports are used:
+Level-correct programs are necessary when using staged programming so
+that the program can be cleanly separated into compile-time and run-time
+portions. The existing mechanism to ensure level correctness for imported
+identifiers is called path-based cross stage persistence and informally it allows you to
+use imported identifiers at any future level.
 
-1. Imported modules whose code is executed only at compile time;
-2. Imported modules whose code is executed only at runtime;
-3. Imported modules whose code is executed both at compile time and runtime.
+The reason we want to remove level correctness via cross stage persistence is
+that the assumption that if an identifier is available at compile-time then it
+will also be available at runtime. This leads to the need to compile all modules
+in a project for both runtime and compile time.
 
-Distinguishing these 3 different cases has several advantages:
+This proposal introduces an explicit means to control the level at which identifiers
+are imported at. Therefore instead of relying on an implicit lifting of an imported
+identifier the programmmer has to explicitly request the identifier will be available
+at a later or earlier stage.
+
+The result is that identifiers can only be used at precisely the level they are
+bound.
+
+By being very precise at levels modules are needed at, there are many advantages:
+
 
 1. Currently, if a module enables ``TemplateHaskell``, then all imported modules
    are compiled to object code before name resolution takes place. This ensures that any top level splices that may be encountered are able to be fully evaluated.
@@ -859,3 +859,43 @@ Unresolved Questions
 * Class constraints
 * Classes in general
 
+.. import for splice -- imports to use within a splice, at level -1
+.. import for quote  -- imports to be used within a quote, at level 1
+.. import for stage -1  -- imports to be used at stage -1, ie at splice
+
+Respond to
+https://github.com/ghc-proposals/ghc-proposals/pull/412#issuecomment-905371210
+with a concrete example of this working with splice + quote imports.
+
+.. NO PATH BASED CSP. Only lifted.
+.. But using lift instances requires the corresponding module to be available at
+.. both runtime and compile time. Bummer but no way around.
+.. No ESI => if imported in module with TH, both. Otherwise, just runtime.
+.. ESI => depending on how its imported, either runtime or compile time or both.
+
+.. Interaction between CSP and ESI
+
+Respond to Sebastian's comment, explain how it works with our system.
+
+-- If you write ``Lift`` then you can't use ExplicitSpliceImports in that module as you need CSP.
+
+1. import splice A, either
+    * A is not ESI
+        * A is needed at compile time and runtime
+        * And all of its dependecies too.
+    * A is ESI
+        * A is needed at compile time
+        * Its normal and splice imports too
+        * Its quote imports needed at runtime, but not compile time
+1a. Module uses TH and import A
+
+2. To define Lift, you CANNOT use ESI because you need CSP::
+
+    X @ 0 and X @ 1
+    x X = [| X |]
+
+3. A module defining lift, and all its dependencies, are needed both at runtime and compile time when splice-imported.
+
+Add information about the possibility to eventually do a ``macro`` keyword, and
+how that can be easily built on top of our design since it essentially amounts
+to splitting a couple of granular definitions into a separate module during elaboration.
