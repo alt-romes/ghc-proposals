@@ -332,10 +332,6 @@ current behaviour of Haskell programs.
 ``NoImplicitLifting`` disables this implicit behaviour in favour of explicitly
 writing out the ``lift`` calls.
 
-The example why implicit lifting may bad:
-
-**TODO!!**
-
 Splice imports
 ##############
 
@@ -532,29 +528,29 @@ The transitive closure of a ``splice`` imported module is at the same level as
 the imported module. ``quote`` imports offset the modules that will be needed
 back to runtime, and make the levels all align correctly.
 
-What about packages
-~~~~~~~~~~~~~~~~~~~
+.. What about packages
+.. ~~~~~~~~~~~~~~~~~~~
 
-As we've seen above, in programs such as::
+.. As we've seen above, in programs such as
 
-    module A where
-    import splice B (foo)
-    x = $(foo)
+..     module A where
+..     import splice B (foo)
+..     x = $(foo)
 
-    module B where
-    import quote C (bar)
+..     module B where
+..     import quote C (bar)
 
-    foo = [| bar |]
+..     foo = [| bar |]
 
-    module C where
-    bar = 42
+..     module C where
+..     bar = 42
 
-``ExplicitStageImports`` improves compilation by only requiring certain modules
-to be loaded at compile-time. In this case, ``B`` will be compiled and loaded
-at compile-time, and ``C`` won't.
+.. ``ExplicitStageImports`` improves compilation by only requiring certain modules
+.. to be loaded at compile-time. In this case, ``B`` will be compiled and loaded
+.. at compile-time, and ``C`` won't.
 
-However, at the package level, this kind of granularity is not good enough.
-Specifically, if this package ``pkg-a`` is imported by some ``pkg-b``, 
+.. However, at the package level, this kind of granularity is not good enough.
+.. Specifically, if this package ``pkg-a`` is imported by some ``pkg-b``,
 
 Higher levels and stages
 ########################
@@ -596,27 +592,45 @@ The dual situation, higher-level quotes, is symmetrical::
     module C where
     bar = 10
 
-First, we observe that whenever the package ``pkg-b`` is used at compile-time,
-it is *also* needed at runtime of the package depending on it since ``pkg-b``
-quotes itself -- despite only loading ``B`` at compile-time (and not ``C``).
+Whenever ``A`` is needed at compile-time (level -1), the bindings quote
+imported from ``B`` may be needed at runtime (level 0) if spliced, but the
+``C`` bindings quote imported from ``B`` are at level 1 and thus used at a
+future runtime::
 
+    module D where
+    import splice A (test)
+    ex = $(test)
 
+If we consider three distinct packages for ``pkg-d`` for ``D``, ``pkg-a`` for ``A`` and ``B``, and ``pkg-c`` for ``C``:
 
-If all modules in a package use ``NoImplicitStagePersistence``...
-The compiler determines at the module-granularity which modules are needed at
-compile-time and which are needed at runtime for all modules using
-``ExplicitStageImports`` and ``NoStageMagic``.
+* ``pkg-a`` depends on ``pkg-c`` at runtime
+* ``pkg-d`` depends on ``pkg-a`` at compile-time (because of the ``splice``
+  import of ``A``) and runtime (because of ``A``'s quote import of ``B``)
+* Therefore, ``pkg-d`` also depends on ``pkg-c`` at runtime, since it is a
+  runtime dependency of ``pkg-a``.
 
-The great benefit of being explicit over implicit is we no longer need to
-pessimistically assume all modules to be needed both at compile-time vs
-run-time, since explicitness tells us exactly which are needed when.
+In this sense, the levels >= 0 also "collapse" into a single runtime stage.
 
-Package Database
-################
+.. First, we observe that whenever the package ``pkg-b`` is used at compile-time,
+.. it is *also* needed at runtime of the package depending on it since ``pkg-b``
+.. quotes itself -- despite only loading ``B`` at compile-time (and not ``C``).
+
+.. If all modules in a package use ``NoImplicitStagePersistence``...
+.. The compiler determines at the module-granularity which modules are needed at
+.. compile-time and which are needed at runtime for all modules using
+.. ``ExplicitStageImports`` and ``NoStageMagic``.
+
+.. The great benefit of being explicit over implicit is we no longer need to
+.. pessimistically assume all modules to be needed both at compile-time vs
+.. run-time, since explicitness tells us exactly which are needed when.
 
 
 Implicit Lifting
 ################
+
+The example why implicit lifting may bad:
+
+**TODO!!**
 
 
 Implementation
