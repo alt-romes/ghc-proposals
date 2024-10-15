@@ -18,18 +18,26 @@ When writing staged programs they must be level correct. We propose a new
 pair of extenensions which allow programmers to write level correct programs without
 resorting to cross-stage persistence.
 
-We propose two new extensions, ``ExplicitStageImports`` and
-``NoImplicitStagePersistence``, that restrict programs to be level-correct.
 ``NoImplicitStagePersistence`` forbids top-level identifiers from occurring at
 non-zero levels (i.e. within top-level splices and quotes), and
 ``ExplicitStageImports`` allows you to explicitly offset the level of imported
 identifiers to enable their use in top-level splices (level -1) or within
 quotes (level 1).
 
-In short:
 
-* The goal -- only allow level correct programs (enforced by ``NoImplicitStagePersistence``).
-* The mechanism -- control level via imports (enabled by ``ExplicitStageImports``).
+
+ImplicitStagePersistence
+------------------------
+
+The ``ImplicitStagePersistence`` extension is introduce to control the
+existing path-based cross stage peristence behaviour. This can now be disabled to
+force programmers to control levels specifically with staged imports.
+
+::
+   data C = C
+
+   -- Allowed due to ``ImplicitStagePeristence``
+   quoteC = [| C |]
 
 ExplicitStageImports
 --------------------
@@ -42,18 +50,6 @@ the level at which identifiers from the module are brought into scope.
   import Foo (baz) -- baz is introduced at level 0
   import splice Foo (qux) -- qux is introduced at level -1
 
-ImplicitStagePersistence
-------------------------
-
-The ``ImplicitStagePersistence`` extension is introduce to control the
-existing path-based cross stage peristence behaviour.
-
-::
-   data C = C
-
-   -- Allowed due to ``ImplicitStagePeristence``
-   quoteC = [| C |]
-
 
 .. When the extension is enabled, path-based cross stage persistence is disabled
 .. and normal imports /cannot/ be used at compile time (at levels ``< 0``).
@@ -65,6 +61,11 @@ lifting is not always desireable (see example in the dedicated section), and
 since we're re-thinking the implicit behaviours concering stages in this
 proposal, it is fitting to also provide an extension to disable this particular
 implicitness.
+
+In short:
+
+* The goal -- only allow level correct programs (enforced by ``NoImplicitStagePersistence``).
+* The mechanism -- control level via imports (enabled by ``ExplicitStageImports``).
 
 Motivation
 ----------
@@ -128,6 +129,8 @@ Definitions
 -----------
 
 level
+  The top-level is level 0.
+
   Each expression exists at a level. The level is increased by 1 when
   inside a quote and decreased by 1 inside a splice. In short:
 
@@ -268,9 +271,9 @@ Conversely, ``ExplicitStageImports`` **introduces** two new import modifiers to 
 ``splice`` and ``quote``.
 
 * A ``splice`` import of ``A`` will import all bindings of ``A`` to be used *only* at
-  compile-time, within top-level splices.
+  level -1 (compile time)
 * A ``quote`` import of ``B`` will import all bindings of ``B`` to be used
-  *only* within quotes, which will be possibly used at runtime when those quotes spliced.
+  *only* at level 1.
 
 Note the symmetry!
 
@@ -298,10 +301,6 @@ level-correct in order to compile -- traditional ``import`` statements bind
 identifiers at level 0 **only**, which means they cannot be used within
 splices (at level -1) nor within quotes (at level 1).
 
-.. This means all top-level identifiers can
-.. only be used at level 0, and otherwise identifiers can be ``splice`` imported
-.. or ``quote`` imported to be introduced at level -1 and 1, respectively.
-
 ExplicitStageImports
 ~~~~~~~~~~~~~~~~~~~~
 
@@ -326,7 +325,7 @@ ImplicitLifting
 ~~~~~~~~~~~~~~~
 
 ``ImplicitLifting`` introduces ``lift`` calls automatically to make programs
-stage correct (i.e. ``f x = [| x |]`` ==> ``f x = [| $(f x) |]``), preserving the
+stage correct (i.e. ``f x = [| x |]`` ==> ``f x = [| $(lift x) |]``), preserving the
 current behaviour of Haskell programs.
 
 ``NoImplicitLifting`` disables this implicit behaviour in favour of explicitly
@@ -625,14 +624,6 @@ In this sense, the levels >= 0 also "collapse" into a single runtime stage.
 .. run-time, since explicitness tells us exactly which are needed when.
 
 
-Implicit Lifting
-################
-
-The example why implicit lifting may bad:
-
-**TODO!!**
-
-
 Implementation
 ################
 
@@ -641,66 +632,36 @@ The syntax for imports is changed in the follow way::
   importdecl :: { LImportDecl GhcPs }
      : 'import' maybe_src maybe_safe optsplice optqualified maybe_pkg modid optqualified maybeas maybeimpspec
 
+  optsplice :: { LImportStage }
+     : 'splice' { SpliceStage }
+     | 'quote'  { QuoteStage  }
+     |          { NormalStage }
 
-The ``splice`` keyword appears before the ``qualified`` keyword but after ``SOURCE``
+
+The ``splice`` or ``quote`` keyword appears before the ``qualified`` keyword but after ``SOURCE``
 and ``SAFE`` pragmas.
 
 Resolution of scopes (often called "renaming") is blind to whether or not an
 identifier was imported with ``splice``. This is important because it will allow
 GHC to emit errors advising the user to modify their import declarations.
 
-The typechecker will be modified to emit errors in the following case:
-
-   It is an error to reference a non-``splice`` imported name from a negative
-   level, and it is an error to reference a ``splice`` imported name from
-   a non-negative level.
-
-
-Then,
-1. If a module is only available at compile time then the imports are only available in top-level splices.
-2. If a module is only available at runtime then the imports are not available in top-level splices.
-3. If a module is available at both runtime and compile time then the imports are available everywhere.
-
 The driver will be modified to ensure that, for modules with
 ``-XTemplateHaskell``, object code is generated for ``splice`` imported modules,
 whereas today it ensures object code is available for all imported modules.
 
 
-Intuitive Specification of ``splice``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Level Specification of staged imports
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~-----
 
-Identifiers arising from splice imports can only be used at negative levels, ie, unquoted in a top-level splice::
-
-  -- Accepted, because B is a splice import and B.qux is used at level -1
-  foo = $(B.qux)
-
-  -- Rejected, because B is a splice import and B.qux is used at level 0
-  foo' =  B.qux
-
-
-But identifiers from normal imports are rejected::
-
-  -- Rejected, as A is not a splice import and used at level -1
-  baz = $(A.zee)
-
-An identifier can appear inside a top-level splice, if it is at a non-negative
-level. For example, the following is legal::
-
-  foo = $(B.qid [| A.zee |] )
-
-Because ``A.zee`` is used at level 0 it doesn't need to be imported using a splice import.
-
-Level Specification of ``splice``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-* Ordinary imports introduce variables at all non-negative levels (>= 0)
-* Splice imports introduce variables at all negative levels. (< 0)
+* Ordinary imports introduce variables at level 0
+* Splice imports introduce variables at level -1
+* Quote imports introduce variables at level 1
 
 Ambiguity of instances and variables
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Resolution of scopes (often called "renaming") is blind to whether or not an
-identifier was imported with ``splice``.
+Resolution of scopes (often called "renaming") is blind to which stage a variable
+has been imported at.
 
 In the case of variables, variables which are splice imported can only be used
 inside a top-level quotation but are reported as ambiguous if they clash with any
@@ -745,15 +706,6 @@ This program is also rejected because the instances defined in ``Normal`` and ``
 
 Other Considerations
 ~~~~~~~~~~~~~~~~~~~~
-
-When ``TemplateHaskell`` is enabled but NOT ``ExplicitStageImports``, then all
-imports are implicitly additionally imported as splice imports because of
-``ImplicitStagePersistence``, which matches the current behaviour.
-
-If the ``Prelude`` module is implicitly imported then it is also imported as a
-splice module. Hence the following is allowed::
-
-  zero = $(id [| 0 |])
 
 If ``NoImplicitPrelude`` is enabled then you have to import ``Prelude`` as a splice
 module as well in order to use names from ``Prelude`` in negative level splices::
@@ -874,7 +826,7 @@ with a concrete example of this working with splice + quote imports.
 .. ESI => depending on how its imported, either runtime or compile time or both.
 
 .. Interaction between CSP and ESI
-
+t
 Respond to Sebastian's comment, explain how it works with our system.
 
 -- If you write ``Lift`` then you can't use ExplicitSpliceImports in that module as you need CSP.
