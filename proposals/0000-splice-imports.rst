@@ -30,26 +30,29 @@ This has a variety of negative consequences. In particular:
   use of the compiler within an IDE (e.g. via Haskell Language Server).
 
 * Cross-compilation is made more difficult by the need to compile code for a
-  platform even though it will never be executed on that platform (see
-  `proposal #243: Stage Hygiene for Template Haskell
-  <https://github.com/ghc-proposals/ghc-proposals/pull/243>`_).
+  platform even though it will never be executed on that platform.
 
 The fundamental problem is implicit cross-stage persistence (CSP): the ability for
 definitions at one stage to be used at a later stage.  Thus we propose a new
 pair of extensions that allow programmers to write level-correct programs
-without resorting to cross-stage persistence:
+without ubiquitous cross-stage persistence:
 
 * ``NoImplicitStagePersistence`` forbids normal top-level identifiers from
-  occurring at non-zero levels (i.e. within top-level splices and quotes), and
+  occurring within top-level splices or quotes, and
 
-* ``ExplicitStageImports`` allows you to explicitly offset the level of
-  imported identifiers to enable their use in top-level splices (level -1) or
-  within quotes (level 1).
+* ``ExplicitStageImports`` allows imports that explicitly enable the use of the
+  imported identifiers within top-level splices or quotes.
 
 In short:
 
 * The goal -- only allow level-correct programs (enforced by ``NoImplicitStagePersistence``).
 * The mechanism -- control level via imports (enabled by ``ExplicitStageImports``).
+
+This proposal draws on ideas discussed previously in
+`proposal #243: Stage Hygiene for Template Haskell
+<https://github.com/ghc-proposals/ghc-proposals/pull/243>`_ and
+`proposal #412: Explicit Splice Imports
+<https://github.com/ghc-proposals/ghc-proposals/pull/412>`_.
 
 
 Motivation
@@ -93,7 +96,7 @@ By being very precise at levels modules are needed at, there are many advantages
 3. IDEs such as Haskell Language Server face similar problems, where they are interested only in the result of type-checking modules, but when ``TemplateHaskell`` is enabled a large
    number of modules have to be cautiously compiled to bytecode.
 4. By using splice imports we can separate the dependencies into those needed only at compile-time and
-   those needed only at runtime. We can then link against only those packages needed at runtime.
+   those needed only at runtime. We can then link against only those modules needed at runtime.
 5. Currently, when cross-compiling modules that use ``TemplateHaskell``, all
    imported modules must be compiled for both host and target.
    By distinguishing imported modules not used at runtime,
@@ -105,18 +108,66 @@ By being very precise at levels modules are needed at, there are many advantages
    improve the applicability of ``TemplateHaskell`` in these scenarios.
 
 
+
+Example
+#######
+
+A very common pattern for using Template Haskell is the following::
+
+  {-# LANGUAGE TemplateHaskell #-}
+  module M where
+    import Control.Lens.TH (makeLenses)
+    import N
+
+    data T = MkT { foo :: Int }
+    $(makeLenses ''T)
+    ...
+
+Here the ``makeLenses`` function is defined in a library, and used in a
+declaration splice to generate some definitions (here lens bindings, but a
+similar pattern is often used where libraries provide a TH-based mechanism for
+deriving instances).
+
+At the moment, GHC must compile dependent module ``N`` before it starts
+type-checking module ``M``, because as far as it knows, running the splice might
+end up executing code from ``N``.  Moreover, when the programmer makes any
+change to the implementation of a function in module ``N``, GHC must re-run the
+``makeLenses`` splice in case its results change. (TODO: is this correct?)
+
+This proposal allows the programmer to be explicit about the fact that
+``makeLenses`` is used only in a splice, whereas the other import is definitely
+not used in splices::
+
+  {-# LANGUAGE ExplicitStageImports #-}
+  {-# LANGUAGE TemplateHaskell #-}
+  module M where
+    import splice Control.Lens.TH (makeLenses)
+    import N
+
+    data T = MkT { foo :: Int }
+    $(makeLenses ''T)
+    ...
+
+Not only does this make the code easier to understand, but moreover GHC can now
+tell from the imports that ``M`` depends only on the interface of ``N``, not on
+its implementation.  Correspondingly, it is possible to start type-checking
+``M`` as soon as ``N`` has been type-checked (before code generation has been
+completed), and changes to the implementation of ``N`` that do not affect its
+interface do not cause recompilation of ``M``.
+
+
 Definitions
 ###########
 
 **level**
-  Within a module, each expression exists at an integer level.  The top-level declarations in the module are at level 0.  The level is increased by 1 when
+  Within a module, every declaration and every (sub-)expression exists at an integer level.  The top-level declarations in the module are at level 0.  The level is increased by 1 when
   inside a quote and decreased by 1 inside a splice. In short:
 
   * ``$(e)`` is at level ``n`` iff ``e`` is at level ``n-1``
   * ``[| e |]`` is at level ``n`` iff ``e`` is at level ``n+1``
 
   Therefore the level of an expression can be calculated as the number of
-  quotes surrounding an expression subtract the number of splices. For
+  quotes surrounding the expression minus the number of splices. For
   example::
 
     -- foo is at level 0
@@ -144,10 +195,11 @@ Definitions
   See `Background: Cross Stage Persistence`_.
 
 **level-correct**
-  TODO
+  A program where every use site of an identifier or class instance occurs at the same level
+  as the level of the definition site.
 
 **top-level splice**
-  A splice whose body is at a negative level, a
+  A splice that does not have any enclosing quotes/splices (i.e. whose body is at a negative level), a
   declaration splice or a quasiquoter.
 
 
@@ -156,10 +208,11 @@ Background: Cross Stage Persistence
 
 Currently, for any module that enables ``TemplateHaskell``, identifiers imported
 from any of its module dependencies can be used at both the top-level (runtime)
-and within top-level splices (compile time).
-Additionally, a variable defined at level ``0`` may be used in
-the body of a quote (i.e. at some level ``n > 0``), and then spliced in the
-future.
+and within top-level splices (compile time). Note that identifiers defined
+within the module cannot be used within splices (this is the *stage restriction*).
+
+Additionally, a locally-bound variable defined at the top-level may be used in
+the body of a quote, and then spliced in the future.
 
 For instance, the following program is accepted::
 
@@ -171,38 +224,36 @@ For instance, the following program is accepted::
     one = [| \x -> succ x |]
 
     two :: Int -> Q Exp
-    two x = [| succ x |]
+    two y = [| succ y |]
 
 Crucially, in the rhs of ``one``, ``succ`` is bound at level 0 (the top-level), but
 used in the body of a quote at level 1 (while ``x`` is bound at level 1).  In
-``two``, both ``succ`` *and* ``x`` are bound at level 0 but used at level 1.
+``two``, both ``succ`` *and* ``y`` are bound at level 0 but used at level 1.
 
 There are two forms of Cross-Stage Persistence (CSP), both of which are needed to
-make this examples work:
+make this example work:
 
-* **Path-based persistence**: all top-level identifiers at level 0 are
-  made available at future levels (i.e., top level ``x`` bound at level ``n`` is also
-  available at level ``n+1``, ``n+2``, ...).
+* **Path-based persistence**: global definitions at level ``n`` are
+  made available at future levels (``n+1``, ``n+2``, ...).
+  Intuitively, this is possible because all global definitions will still exist in
+  the defining module even if references to them are spliced at a future stage.
 
-  Intuitively, this is fine because all top-level identifiers will still exist in
-  that module even if spliced at a future stage.
+  This explains why the occurrence of ``succ`` in examples ``one`` and ``two`` is valid.
 
-  This explains why the occurrence of ``succ`` in example ``one`` and ``two`` is valid.
-
-* **Serialisation-based/Lift persistence**: locally-bound variables can't be persisted
+* **Serialisation-based persistence (Lift)**: locally-bound variables can't be persisted
   to a future stage using path-based CSP, but provided the variable's type is serialisable, we
   can serialise its value to persist it to future stages. This serialisation is
   defined as the ``lift`` method of the ``Lift`` typeclass.
 
-  Serialisation-based CSP explains why the ``x`` in ``two`` can be moved from
+  Serialisation-based CSP explains why the ``y`` in ``two`` can be moved from
   a value that exists at compile time to one that exists at runtime. The
   compiler will implicitly introduce a call to ``lift`` such as::
 
-      two x = [| succ x |]
+      two y = [| succ y |]
       ===>
-      two x = [| succ $(lift x) |]
+      two y = [| succ $(lift y) |]
 
-  And ``lift`` will take care of converting the compile-time ``x`` into a runtime value.
+  And ``lift`` will take care of converting the compile-time ``y`` into a runtime value.
   All base types such as ``Int``, ``Bool``, ``Float``, ... instantiate ``Lift``, and user
   types can instantiate it automatically with ``DeriveLift``.
 
@@ -279,11 +330,15 @@ explained in the Motivation section, this is suboptimal because it often results
 unnecessary work at compile-time and
 linking into the binary code that is unnecessary at runtime.
 
-Under ``NoImplicitStagePersistence``, the program must be well-staged
-(level-correct) in order to pass the type-checker. That is, identifiers may be used only
+Under ``NoImplicitStagePersistence``, the program must be
+level-correct in order to pass the type-checker. That is, identifiers may be used only
 at the same level at which they were bound. Traditional ``import`` statements bind
 identifiers at level 0 **only**, which means the identifiers cannot be used within
 splices (at level -1) nor within quotes (at level 1).
+
+Under ``NoImplicitStagePersistence`` it is an error to derive a stock instance
+of ``Lift`` using the ``DeriveLift`` extension. See `Deriving Lift instances
+and implicit lifting`_.
 
 
 ExplicitStageImports
@@ -330,8 +385,10 @@ The ``splice`` or ``quote`` keyword appears before the ``qualified`` keyword but
 and ``SAFE`` pragmas.
 
 
-Level Specification of staged imports
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Level specification of staged imports
+#####################################
+
+TODO: explain this more clearly
 
 * Ordinary imports introduce variables at level 0
 * Splice imports introduce variables at level -1
@@ -345,7 +402,7 @@ The ``splice`` or ``quote`` imported modules themselves may use normal, ``splice
   compile-time, since they may be used in the code generation step of the
   module being imported.
 
-All exported names are at level 0. Splice imports can't be rexported, unless
+All exported names must exist at level 0. Splice or quote imports can't be rexported, unless
 they are also imported normally.
 Allowing splice imports to be exported would turn a build-time only import into a runtime
 export, which is not level-correct.
@@ -542,7 +599,7 @@ needed at runtime, when identifiers from this module are spliced, are marked
 explicitly as so.
 
 Clarifying what runtime is
-~~~~~~~~~~~~~~~~~~~~~~~~~~
+##########################
 
 This is a bit unintuitive at first: aren't all imported modules by default
 available at runtime -- and only splice imported ones at compile-time?  We've
@@ -668,36 +725,41 @@ compilation *stage* that happens at ``A``'s compile time.
 
 The dual situation, higher-level quotes, is symmetrical::
 
-    -- pkg-b
     module A where
-    import quote B (foo)
-    test = [| foo |]
-
-    module B where
-    import quote C (bar)
-    foo = [| bar |]
-
-    module C where
-    bar = 10
-
-Whenever ``A`` is needed at compile-time (level -1), the bindings quote
-imported from ``B`` may be needed at runtime (level 0) if spliced, but the
-``C`` bindings quote imported from ``B`` are at level 1 and thus used at a
-future runtime::
-
-    module D where
-    import splice A (test)
+    import splice B (test)
     ex = $(test)
 
-If we consider three distinct packages for ``pkg-d`` for ``D``, ``pkg-a`` for ``A`` and ``B``, and ``pkg-c`` for ``C``:
+    module B where
+    import quote C (foo)
+    test = [| foo |]
 
-* ``pkg-a`` depends on ``pkg-c`` at runtime
-* ``pkg-d`` depends on ``pkg-a`` at compile-time (because of the ``splice``
-  import of ``A``) and runtime (because of ``A``'s quote import of ``B``)
-* Therefore, ``pkg-d`` also depends on ``pkg-c`` at runtime, since it is a
-  runtime dependency of ``pkg-a``.
+    module C where
+    import quote D (bar)
+    foo = [| bar |]
 
-In this sense, the levels >= 0 also "collapse" into a single runtime stage.
+    module D where
+    bar = 10
+
+From the perspective of ``B`` (when it is considered level 0), its import of ``C`` is at level 1
+and the transitive import of ``D`` is at level 2.
+But when ``A`` is compiled, ``B`` is needed at compile-time (level -1), the bindings quote
+imported from ``C`` may be needed at runtime (level 0) if spliced, but the
+``D`` bindings quote imported from ``C`` are at level 1 and thus used at a
+future runtime.
+
+TODO: it's not entirely clear what point this section is making by the talk of
+collapsing levels into stages.
+
+
+.. If we consider three distinct packages for ``pkg-d`` for ``D``, ``pkg-a`` for ``A`` and ``B``, and ``pkg-c`` for ``C``:
+..
+.. * ``pkg-a`` depends on ``pkg-c`` at runtime
+.. * ``pkg-d`` depends on ``pkg-a`` at compile-time (because of the ``splice``
+..   import of ``A``) and runtime (because of ``A``'s quote import of ``B``)
+.. * Therefore, ``pkg-d`` also depends on ``pkg-c`` at runtime, since it is a
+..   runtime dependency of ``pkg-a``.
+..
+.. In this sense, the levels >= 0 also "collapse" into a single runtime stage.
 
 .. First, we observe that whenever the package ``pkg-b`` is used at compile-time,
 .. it is *also* needed at runtime of the package depending on it since ``pkg-b``
@@ -741,7 +803,8 @@ Deriving Lift instances and implicit lifting
 ############################################
 
 TODO: explain the problem with ``Lift`` instances, the relationship between
-``DeriveLift`` and our new extensions, and motivate our position.
+``DeriveLift`` and our new extensions, and motivate our position.  If we are
+planning to make a separate proposal for ``ImplicitLifting``, say so.
 
 It isn't possible to define a non-orphan ``Lift`` instance with
 ``NoImplicitStagePersistence``, because the definition of ``Lift``
@@ -848,8 +911,11 @@ edition, this would be a breaking change, but we do not propose this pending
 implementation and experience with the feature.
 
 
-Future Feature Compatibility
-----------------------------
+Future Directions
+-----------------
+
+Multiple levels within a single module
+######################################
 
 One possible design that mitigates the need for module-level granularity of
 imports, inspired by the Racket language, is the introduction of an
@@ -874,6 +940,46 @@ We believe this proposal shouldn't include such a change for two reasons:
   yields the same results wrt to having a dedicated ``macro``)
 
 
+Level-correct package dependencies
+##################################
+
+The splice and quote imports in this proposal make it possible to express which
+module dependencies are required at which stages.  Ultimately, it would make
+sense to expose this distinction at the level of Cabal packages, so that Cabal
+could build package dependencies only for the stages at which they are required.
+This would primarily be of value in cross-compilation scenarios.
+
+In the interests of keeping the work manageable, changes to Cabal are out of
+scope for the current proposal, but we believe this proposal lays a foundation
+for future work to improve Cabal's cross-compilation support.
+
+
+Imports with explicit level numbers
+###################################
+
+The current proposal permits imports only at levels -1, 0 or 1. This means it is
+not possible to introduce a binding for use in a splice contained within another
+splice, which would require it to be at level -2.  (Note that nested quotes are
+in any case not supported in GHC due to a separate restriction.)
+
+An alternative would be to allow even finer grained control of splice imports so
+that usage at level -2 or lower could be distinguished. This could be useful in
+some cross-compilation situations. This is the approach suggested in the `Stage
+Hygiene for Template Haskell proposal
+<https://github.com/ghc-proposals/ghc-proposals/pull/243>`_.
+
+The syntax in this proposal could be extended in a natural way to allow for this by adding an optional
+integer component which specifies precisely what level the imported names should be allowed at::
+
+    -- Can be used at -1
+    import splice 1 A
+    -- Can be used at -2
+    import splice 2 A
+
+Practically, by far the most common situation is 2 stages, so in the interests
+of reducing complexity we do not propose supporting this at present.
+
+
 Alternatives
 ------------
 
@@ -896,25 +1002,6 @@ Alternatives
   splice imports are when using GHC's ``--make`` mode. As the proposal stands,
   for uniformity, any module used inside a top-level splice must be marked as
   a splice module, even if it's an external module.
-
-* Another alternative would be to allow even finer grained control of splice
-  imports so that the cases of usage at levels -1 or -2 could be distinguished.
-  This could be useful in some cross-compilation situations. This is the approach
-  suggested in the `Stage Hygiene for Template Haskell proposal <https://github.com/ghc-proposals/ghc-proposals/pull/243>`_.
-
-  The syntax in this proposal can be extended in a natural way to allow for this by adding an optional
-  integer component which specifies precisely what level the imported names should be allowed at::
-
-    -- Can be used at -1
-    import splice 1 A
-    -- Can be used at -2
-    import splice 2 A
-
-  Practically, by far the most common situation is 2 stages.
-
-  TODO: expand on the above comparison with the Stage Hygiene paper. Why don't
-  we allow explicit levels? What happens if we want to write a program that
-  needs an identifier at level -2?
 
 * Since ``ExplicitStageImports`` is essentially useless when
   ``TemplateHaskell`` is disabled, we could have ``ExplicitStageImports`` imply
@@ -944,7 +1031,6 @@ Alternatives
   On the other hand, it's quite unfortunate to require having yet another
   package just for TH, and may drive away adoption...
 
-  TODO: need more discussion of the packaging implications of this proposal.
 
 Unresolved Questions
 --------------------
@@ -984,11 +1070,6 @@ Unresolved Questions
 ..         * Its normal and splice imports too
 ..         * Its quote imports needed at runtime, but not compile time
 .. 1a. Module uses TH and import A
-
-
-TODO: elaborate on ``makeLenses`` as an example.  Do we need to define the
-datatype and its lenses in separate modules?
-
 
 
 Implementation Plan
